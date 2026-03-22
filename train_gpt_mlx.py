@@ -80,6 +80,8 @@ class Hyperparameters:
     logit_softcap: float = float(os.environ.get("LOGIT_SOFTCAP", 30.0))
     rope_base: float = float(os.environ.get("ROPE_BASE", 10000.0))
     qk_gain_init: float = float(os.environ.get("QK_GAIN_INIT", 1.5))
+    bigram_vocab_size: int = int(os.environ.get("BIGRAM_VOCAB_SIZE", 4096))
+    bigram_dim: int = int(os.environ.get("BIGRAM_DIM", 128))
 
     # Optimizer. We keep the same per-group defaults as train_gpt.py.
     beta1: float = float(os.environ.get("BETA1", 0.9))
@@ -379,6 +381,20 @@ class Block(nn.Module):
         return x
 
 
+class BigramHash(nn.Module):
+    def __init__(self, bigram_vocab_size: int, bigram_dim: int, model_dim: int):
+        super().__init__()
+        self.bigram_vocab_size = bigram_vocab_size
+        self.embedding = nn.Embedding(bigram_vocab_size, bigram_dim)
+        self.proj = nn.Linear(bigram_dim, model_dim, bias=False)
+
+    def __call__(self, tokens: mx.array) -> mx.array:
+        prev_tokens = mx.concatenate(
+            [mx.zeros_like(tokens[:, :1]), tokens[:, :-1]], axis=1
+        )
+        buckets = (prev_tokens * 31 + tokens) % self.bigram_vocab_size
+        return self.proj(self.embedding(buckets))
+
 class GPT(nn.Module):
     # - token embedding + RMSNorm
     # - encoder half accumulates skip tensors
@@ -386,7 +402,9 @@ class GPT(nn.Module):
     # - tied embeddings for the LM head (the baseline default setup)
     def __init__(self, vocab_size: int, num_layers: int, dim: int, num_heads: int, num_kv_heads: int, mlp_mult: int,
                  logit_chunk_tokens: int, logit_softcap: float, rope_base: float, tied_embed_init_std: float,
-                 qk_gain_init: float):
+                 qk_gain_init: float,
+                 bigram_vocab_size: int = 4096,
+                 bigram_dim: int = 128):
         super().__init__()
         if logit_softcap <= 0.0:
             raise ValueError(f"logit_softcap must be positive, got {logit_softcap}")
@@ -394,6 +412,7 @@ class GPT(nn.Module):
         self.logit_softcap = logit_softcap
 
         self.tok_emb = nn.Embedding(vocab_size, dim)
+        self.bigram_hash = BigramHash(bigram_vocab_size, bigram_dim, dim)
         self.num_encoder_layers = num_layers // 2
         self.num_decoder_layers = num_layers - self.num_encoder_layers
         self.num_skip_weights = min(self.num_encoder_layers, self.num_decoder_layers)
@@ -417,6 +436,7 @@ class GPT(nn.Module):
 
     def __call__(self, input_ids: mx.array) -> mx.array:
         x = rms_norm(self.tok_emb(input_ids).astype(COMPUTE_DTYPE))
+        x = x + self.bigram_hash(input_ids).astype(COMPUTE_DTYPE)
         x0 = x
         skips: list[mx.array] = []
 
@@ -897,6 +917,8 @@ def main() -> None:
         rope_base=args.rope_base,
         tied_embed_init_std=args.tied_embed_init_std,
         qk_gain_init=args.qk_gain_init,
+        bigram_vocab_size=args.bigram_vocab_size,
+        bigram_dim=args.bigram_dim,
     )
     opt = SplitOptimizers(model, args)
 
