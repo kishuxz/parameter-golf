@@ -69,6 +69,7 @@ class Hyperparameters:
     ssm_d_state = int(os.environ.get("SSM_D_STATE", 16))
     ssm_d_conv = int(os.environ.get("SSM_D_CONV", 4))
     ssm_expand = int(os.environ.get("SSM_EXPAND", 2))
+    scan_chunk_size = int(os.environ.get("SCAN_CHUNK_SIZE", 256))
     hybrid_layers = int(os.environ.get("HYBRID_LAYERS", 0))
     tie_embeddings = bool(int(os.environ.get("TIE_EMBEDDINGS", "1")))
     rope_base = float(os.environ.get("ROPE_BASE", 10000.0))
@@ -608,8 +609,8 @@ class CausalSelfAttention(nn.Module):
 
 
 class MambaSSM(nn.Module):
-    # Mamba-style selective SSM block with a simple sequential scan.
-    def __init__(self, dim: int, d_state: int, d_conv: int, expand: int):
+    # Mamba-style selective SSM block with chunked associative scan.
+    def __init__(self, dim: int, d_state: int, d_conv: int, expand: int, scan_chunk_size: int):
         super().__init__()
         if d_state <= 0:
             raise ValueError(f"SSM_D_STATE must be positive, got {d_state}")
@@ -617,9 +618,12 @@ class MambaSSM(nn.Module):
             raise ValueError(f"SSM_D_CONV must be positive, got {d_conv}")
         if expand <= 0:
             raise ValueError(f"SSM_EXPAND must be positive, got {expand}")
+        if scan_chunk_size <= 0:
+            raise ValueError(f"SCAN_CHUNK_SIZE must be positive, got {scan_chunk_size}")
         self.d_state = d_state
         self.d_conv = d_conv
         self.expand = expand
+        self.scan_chunk_size = scan_chunk_size
         self.inner_dim = dim * expand
         self.in_proj = CastedLinear(dim, 2 * self.inner_dim, bias=False)
         self.conv1d = nn.Conv1d(
@@ -643,6 +647,55 @@ class MambaSSM(nn.Module):
         self.out_proj = CastedLinear(self.inner_dim, dim, bias=False)
         self.out_proj._zero_init = True
 
+    @staticmethod
+    def parallel_scan(A: Tensor, B: Tensor, chunk_size: int) -> Tensor:
+        # Computes h_t = A_t * h_{t-1} + B_t, h_{-1}=0, using log-space products.
+        # A: (batch, seq, channels), B: (batch, seq, channels), return h same shape.
+        if A.shape != B.shape:
+            raise ValueError(f"parallel_scan expects A and B with same shape, got {A.shape} vs {B.shape}")
+        if A.ndim != 3:
+            raise ValueError(f"parallel_scan expects rank-3 tensors, got rank {A.ndim}")
+        bsz, seqlen, channels = A.shape
+        if seqlen == 0:
+            return B
+
+        # Keep scan math in fp32 for stability under autocast, then cast back.
+        with torch.cuda.amp.autocast(enabled=False):
+            A32 = A.float().clamp_min(1e-12)
+            B32 = B.float()
+            if chunk_size >= seqlen:
+                log_prefix = torch.cumsum(torch.log(A32), dim=1)
+                prefix = torch.exp(log_prefix)
+                h32 = prefix * torch.cumsum(B32 * torch.exp(-log_prefix), dim=1)
+                return h32.to(dtype=A.dtype)
+
+            n_chunks = (seqlen + chunk_size - 1) // chunk_size
+            padded_len = n_chunks * chunk_size
+            if padded_len != seqlen:
+                pad_tokens = padded_len - seqlen
+                A32 = F.pad(A32, (0, 0, 0, pad_tokens), value=1.0)
+                B32 = F.pad(B32, (0, 0, 0, pad_tokens), value=0.0)
+
+            A_chunks = A32.reshape(bsz, n_chunks, chunk_size, channels)
+            B_chunks = B32.reshape(bsz, n_chunks, chunk_size, channels)
+            log_prefix = torch.cumsum(torch.log(A_chunks), dim=2)
+            prefix = torch.exp(log_prefix)
+            local_h = prefix * torch.cumsum(B_chunks * torch.exp(-log_prefix), dim=2)
+
+            # Chunk summaries: h_out = a_chunk * h_in + b_chunk.
+            chunk_a = prefix[:, :, -1, :]
+            chunk_b = local_h[:, :, -1, :]
+            chunk_end = torch.empty_like(chunk_b)
+            h_prev = torch.zeros((bsz, channels), device=A.device, dtype=torch.float32)
+            for i in range(n_chunks):
+                h_prev = chunk_a[:, i, :] * h_prev + chunk_b[:, i, :]
+                chunk_end[:, i, :] = h_prev
+            chunk_start = torch.cat((torch.zeros_like(chunk_end[:, :1, :]), chunk_end[:, :-1, :]), dim=1)
+
+            h_chunks = local_h + prefix * chunk_start[:, :, None, :]
+            h32 = h_chunks.reshape(bsz, padded_len, channels)[:, :seqlen, :]
+            return h32.to(dtype=A.dtype)
+
     def forward(self, x: Tensor) -> Tensor:
         bsz, seqlen, _ = x.shape
         xz = self.in_proj(x)
@@ -659,26 +712,20 @@ class MambaSSM(nn.Module):
         C = params[..., self.inner_dim + self.d_state :]
         delta = F.softplus(delta_raw + self.delta_bias.to(dtype=delta_raw.dtype)[None, None, :])
 
-        # Selective SSM equations (per token t):
+        # Selective SSM equations:
         #   h_t = exp(delta_t * A) * h_{t-1} + (delta_t * B_t) * u_t
         #   y_t = <C_t, h_t> + D * u_t
         # where B_t, C_t, and delta_t are input-dependent (selective),
         # A and D are learned global parameters, and h_t is the latent state.
         A = -torch.exp(self.A_log.to(dtype=u.dtype))[None, :, :]
-        state = torch.zeros((bsz, self.inner_dim, self.d_state), device=x.device, dtype=u.dtype)
-        ys: list[Tensor] = []
-        for t in range(seqlen):
-            delta_t = delta[:, t, :]
-            u_t = u[:, t, :]
-            B_t = B[:, t, :]
-            C_t = C[:, t, :]
-            dA = torch.exp(delta_t.unsqueeze(-1) * A)
-            dBu = delta_t.unsqueeze(-1) * B_t.unsqueeze(1) * u_t.unsqueeze(-1)
-            state = dA * state + dBu
-            y_t = (state * C_t.unsqueeze(1)).sum(dim=-1) + self.D.to(dtype=u.dtype)[None, :] * u_t
-            ys.append(y_t)
-
-        y = torch.stack(ys, dim=1)
+        dA = torch.exp(delta.unsqueeze(-1) * A.unsqueeze(0))
+        dBu = delta.unsqueeze(-1) * B.unsqueeze(2) * u.unsqueeze(-1)
+        scan_A = dA.reshape(bsz, seqlen, self.inner_dim * self.d_state)
+        scan_B = dBu.reshape(bsz, seqlen, self.inner_dim * self.d_state)
+        state = self.parallel_scan(scan_A, scan_B, chunk_size=self.scan_chunk_size).reshape(
+            bsz, seqlen, self.inner_dim, self.d_state
+        )
+        y = (state * C.unsqueeze(2)).sum(dim=-1) + self.D.to(dtype=u.dtype)[None, None, :] * u
         y = y * torch.sigmoid(gate)
         return self.out_proj(y)
 
@@ -710,6 +757,7 @@ class Block(nn.Module):
         ssm_d_state: int,
         ssm_d_conv: int,
         ssm_expand: int,
+        scan_chunk_size: int,
     ):
         super().__init__()
         self.attn_norm = RMSNorm()
@@ -717,7 +765,9 @@ class Block(nn.Module):
         self.attn = (
             CausalSelfAttention(dim, num_heads, num_kv_heads, rope_base, qk_gain_init)
             if use_attention
-            else MambaSSM(dim, d_state=ssm_d_state, d_conv=ssm_d_conv, expand=ssm_expand)
+            else MambaSSM(
+                dim, d_state=ssm_d_state, d_conv=ssm_d_conv, expand=ssm_expand, scan_chunk_size=scan_chunk_size
+            )
         )
         self.mlp = MLP(dim, mlp_mult)
         self.attn_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
@@ -750,6 +800,7 @@ class GPT(nn.Module):
         ssm_d_state: int,
         ssm_d_conv: int,
         ssm_expand: int,
+        scan_chunk_size: int,
         hybrid_layers: int,
     ):
         super().__init__()
@@ -779,6 +830,7 @@ class GPT(nn.Module):
                     ssm_d_state=ssm_d_state,
                     ssm_d_conv=ssm_d_conv,
                     ssm_expand=ssm_expand,
+                    scan_chunk_size=scan_chunk_size,
                 )
                 for i in range(num_layers)
             ]
@@ -937,6 +989,7 @@ def main() -> None:
         ssm_d_state=args.ssm_d_state,
         ssm_d_conv=args.ssm_d_conv,
         ssm_expand=args.ssm_expand,
+        scan_chunk_size=args.scan_chunk_size,
         hybrid_layers=args.hybrid_layers,
     ).to(device).bfloat16()
     for module in base_model.modules():
@@ -1020,6 +1073,7 @@ def main() -> None:
     )
     log0(
         f"ssm_config:d_state={args.ssm_d_state} d_conv={args.ssm_d_conv} expand={args.ssm_expand} "
+        f"scan_chunk_size={args.scan_chunk_size} "
         f"num_heads:{args.num_heads} num_kv_heads:{args.num_kv_heads}"
     )
     log0(
