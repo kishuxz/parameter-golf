@@ -73,6 +73,45 @@ MAX_WALLCLOCK_SECONDS=120 \
 torchrun --standalone --nproc_per_node=1 train_gpt.py 2>&1 | tee logs/golfmix_size_safe_9216.log
 ```
 
+## C4. Full size-safe run: BigramHash 4096, MLP hidden 1504
+
+```bash
+RUN_ID=golfmix_full_b4096_mlp1504 \
+BIGRAM_VOCAB_SIZE_OVERRIDE=4096 \
+MLP_HIDDEN_OVERRIDE=1504 \
+USE_DAFFN=0 \
+USE_STARRELU=0 \
+USE_NGRAM_MIX=0 \
+MAX_WALLCLOCK_SECONDS=600 \
+torchrun --standalone --nproc_per_node=1 train_gpt.py 2>&1 | tee logs/golfmix_full_b4096_mlp1504.log
+```
+
+## C5. Full size-safe run: BigramHash 4096, MLP hidden 1472
+
+```bash
+RUN_ID=golfmix_full_b4096_mlp1472 \
+BIGRAM_VOCAB_SIZE_OVERRIDE=4096 \
+MLP_HIDDEN_OVERRIDE=1472 \
+USE_DAFFN=0 \
+USE_STARRELU=0 \
+USE_NGRAM_MIX=0 \
+MAX_WALLCLOCK_SECONDS=600 \
+torchrun --standalone --nproc_per_node=1 train_gpt.py 2>&1 | tee logs/golfmix_full_b4096_mlp1472.log
+```
+
+## C6. Full fallback run: BigramHash 3072, MLP hidden 1536
+
+```bash
+RUN_ID=golfmix_full_b3072_mlp1536 \
+BIGRAM_VOCAB_SIZE_OVERRIDE=3072 \
+MLP_HIDDEN_OVERRIDE=1536 \
+USE_DAFFN=0 \
+USE_STARRELU=0 \
+USE_NGRAM_MIX=0 \
+MAX_WALLCLOCK_SECONDS=600 \
+torchrun --standalone --nproc_per_node=1 train_gpt.py 2>&1 | tee logs/golfmix_full_b3072_mlp1536.log
+```
+
 ## D. DAFFN middle-heavy ablation
 
 ```bash

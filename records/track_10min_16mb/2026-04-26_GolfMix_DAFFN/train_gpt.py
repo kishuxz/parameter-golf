@@ -55,6 +55,18 @@ def _env_bool(name: str, default: str = "0") -> bool:
     return bool(int(os.environ.get(name, default)))
 
 
+def _optional_positive_int(name: str, multiple: int | None = None) -> int | None:
+    value = os.environ.get(name)
+    if value is None:
+        return None
+    parsed = int(value)
+    if parsed <= 0:
+        raise ValueError(f"{name} must be positive, got {parsed}")
+    if multiple is not None and parsed % multiple != 0:
+        raise ValueError(f"{name} must be divisible by {multiple}, got {parsed}")
+    return parsed
+
+
 class Hyperparameters:
     data_path = os.environ.get("DATA_PATH", _repo_relative_default("data/datasets/fineweb10B_sp1024"))
     train_files = os.path.join(data_path, "fineweb_train_*.bin")
@@ -119,6 +131,8 @@ class Hyperparameters:
     mlp_mult_min = float(os.environ.get("MLP_MULT_MIN", 2.0))
     mlp_mult_max = float(os.environ.get("MLP_MULT_MAX", 4.0))
     mlp_mult_avg = float(os.environ.get("MLP_MULT_AVG", 3.0))
+    mlp_hidden_default = int(round((mlp_mult * model_dim) / 64.0) * 64)
+    mlp_hidden_override = _optional_positive_int("MLP_HIDDEN_OVERRIDE", multiple=32)
 
     use_ngram_mix = _env_bool("USE_NGRAM_MIX", "0")
     ngram_min_order = int(os.environ.get("NGRAM_MIN_ORDER", 2))
@@ -754,6 +768,7 @@ class GPT(nn.Module):
         mlp_mult_min: float = 2.0,
         mlp_mult_max: float = 4.0,
         mlp_mult_avg: float = 3.0,
+        mlp_hidden_override: int | None = None,
     ):
         super().__init__()
         if logit_softcap <= 0.0:
@@ -764,10 +779,25 @@ class GPT(nn.Module):
         self.use_daffn = use_daffn
         self.mlp_schedule = mlp_schedule
         self.use_starrelu = use_starrelu
+        self.mlp_hidden_default = int(round((mlp_mult * model_dim) / 64.0) * 64)
+        self.mlp_hidden_override = mlp_hidden_override
         self.mlp_multipliers = build_mlp_multipliers(
             num_layers, mlp_mult, use_daffn, mlp_schedule, mlp_mult_min, mlp_mult_max, mlp_mult_avg
         )
-        self.mlp_hidden_sizes = [int(round((m * model_dim) / 64.0) * 64) for m in self.mlp_multipliers]
+        if mlp_hidden_override is not None:
+            if mlp_hidden_override <= 0 or mlp_hidden_override % 32 != 0:
+                raise ValueError(
+                    f"MLP_HIDDEN_OVERRIDE must be positive and divisible by 32, got {mlp_hidden_override}"
+                )
+            if use_daffn:
+                raw_hidden = [m * model_dim for m in self.mlp_multipliers]
+                raw_avg = sum(raw_hidden) / len(raw_hidden)
+                scale = mlp_hidden_override / raw_avg
+                self.mlp_hidden_sizes = [int(round((h * scale) / 32.0) * 32) for h in raw_hidden]
+            else:
+                self.mlp_hidden_sizes = [mlp_hidden_override for _ in range(num_layers)]
+        else:
+            self.mlp_hidden_sizes = [int(round((m * model_dim) / 64.0) * 64) for m in self.mlp_multipliers]
         self.mlp_multipliers = [h / model_dim for h in self.mlp_hidden_sizes]
         self.tok_emb = nn.Embedding(vocab_size, model_dim)
         self.bigram = BigramHashEmbedding(bigram_vocab_size, bigram_dim, model_dim) if bigram_vocab_size > 0 else None
@@ -969,6 +999,10 @@ def format_mlp_schedule(model: GPT) -> str:
     return " ".join(parts)
 
 
+def mlp_matrix_param_count(model_dim: int, hidden_sizes: list[int]) -> int:
+    return int(sum(2 * model_dim * hidden for hidden in hidden_sizes))
+
+
 def maybe_log_ngram_mix_status(args: Hyperparameters, log0) -> None:
     # Legal caution: an eval-time n-gram model must be built only from training tokens
     # or other challenge-allowed training data, never from validation tokens before
@@ -1017,9 +1051,19 @@ def main() -> None:
             mlp_mult_min=args.mlp_mult_min,
             mlp_mult_max=args.mlp_mult_max,
             mlp_mult_avg=args.mlp_mult_avg,
+            mlp_hidden_override=args.mlp_hidden_override,
         )
         print(f"model_init_check:ok params:{sum(p.numel() for p in check_model.parameters())}")
         print(f"bigram_vocab_size_final:{args.bigram_vocab_size} override:{args.bigram_vocab_size_override}")
+        base_mlp_params = mlp_matrix_param_count(
+            args.model_dim, [args.mlp_hidden_default for _ in range(args.num_layers)]
+        )
+        final_mlp_params = mlp_matrix_param_count(args.model_dim, check_model.mlp_hidden_sizes)
+        print(
+            f"mlp_hidden_default:{args.mlp_hidden_default} "
+            f"mlp_hidden_override:{args.mlp_hidden_override} "
+            f"mlp_param_delta:{final_mlp_params - base_mlp_params}"
+        )
         print(f"mlp_schedule:{format_mlp_schedule(check_model)}")
         print(f"param_components:{count_parameters_by_component(check_model)}")
         return
@@ -1120,6 +1164,7 @@ def main() -> None:
         mlp_mult_min=args.mlp_mult_min,
         mlp_mult_max=args.mlp_mult_max,
         mlp_mult_avg=args.mlp_mult_avg,
+        mlp_hidden_override=args.mlp_hidden_override,
     ).to(device).bfloat16()
     for module in base_model.modules():
         if isinstance(module, CastedLinear):
@@ -1185,6 +1230,10 @@ def main() -> None:
 
     n_params = sum(p.numel() for p in base_model.parameters())
     component_counts = count_parameters_by_component(base_model)
+    base_mlp_matrix_params = mlp_matrix_param_count(
+        args.model_dim, [args.mlp_hidden_default for _ in range(args.num_layers)]
+    )
+    final_mlp_matrix_params = mlp_matrix_param_count(args.model_dim, base_model.mlp_hidden_sizes)
     log0(f"run_id:{args.run_id}")
     log0(f"base_selected:{BASE_RECORD}")
     log0(
@@ -1197,6 +1246,13 @@ def main() -> None:
         f"num_heads:{args.num_heads} num_kv_heads:{args.num_kv_heads}"
     )
     log0(f"mlp_schedule:{format_mlp_schedule(base_model)}")
+    log0(
+        f"mlp_hidden_default:{args.mlp_hidden_default} "
+        f"mlp_hidden_override:{args.mlp_hidden_override} "
+        f"mlp_matrix_params_default:{base_mlp_matrix_params} "
+        f"mlp_matrix_params_final:{final_mlp_matrix_params} "
+        f"mlp_matrix_param_delta:{final_mlp_matrix_params - base_mlp_matrix_params}"
+    )
     log0(
         f"daffn_enabled:{args.use_daffn} mlp_schedule_name:{args.mlp_schedule} "
         f"mlp_mult_min:{args.mlp_mult_min} mlp_mult_max:{args.mlp_mult_max} "
