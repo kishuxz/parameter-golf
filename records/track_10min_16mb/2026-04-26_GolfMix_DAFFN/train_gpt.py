@@ -104,7 +104,9 @@ class Hyperparameters:
     eval_stride = int(os.environ.get("EVAL_STRIDE", 64))
     eval_batch_seqs = int(os.environ.get("EVAL_BATCH_SEQS", 32))
 
-    bigram_vocab_size = int(os.environ.get("BIGRAM_VOCAB_SIZE", 10240))
+    bigram_vocab_size_default = int(os.environ.get("BIGRAM_VOCAB_SIZE", 10240))
+    bigram_vocab_size_override = os.environ.get("BIGRAM_VOCAB_SIZE_OVERRIDE")
+    bigram_vocab_size = int(bigram_vocab_size_override) if bigram_vocab_size_override is not None else bigram_vocab_size_default
     bigram_dim = int(os.environ.get("BIGRAM_DIM", 128))
 
     swa_enabled = bool(int(os.environ.get("SWA_ENABLED", "1")))
@@ -1017,6 +1019,7 @@ def main() -> None:
             mlp_mult_avg=args.mlp_mult_avg,
         )
         print(f"model_init_check:ok params:{sum(p.numel() for p in check_model.parameters())}")
+        print(f"bigram_vocab_size_final:{args.bigram_vocab_size} override:{args.bigram_vocab_size_override}")
         print(f"mlp_schedule:{format_mlp_schedule(check_model)}")
         print(f"param_components:{count_parameters_by_component(check_model)}")
         return
@@ -1200,7 +1203,12 @@ def main() -> None:
         f"mlp_mult_avg:{args.mlp_mult_avg} starrelu_enabled:{args.use_starrelu}"
     )
     log0("xsa_enabled:false recurrence_enabled:false")
-    log0(f"hash_embeddings_enabled:{base_model.bigram is not None} bigram_vocab_size:{args.bigram_vocab_size} bigram_dim:{args.bigram_dim}")
+    log0(
+        f"hash_embeddings_enabled:{base_model.bigram is not None} "
+        f"bigram_vocab_size_final:{args.bigram_vocab_size} "
+        f"bigram_vocab_size_override:{args.bigram_vocab_size_override} "
+        f"bigram_dim:{args.bigram_dim}"
+    )
     log0(
         f"optimizer:Muon matrix_lr:{args.matrix_lr} muon_wd:0.04 momentum:{args.muon_momentum} "
         f"momentum_warmup:{args.muon_momentum_warmup_start}->{args.muon_momentum}/"

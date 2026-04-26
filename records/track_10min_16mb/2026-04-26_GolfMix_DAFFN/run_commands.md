@@ -35,6 +35,44 @@ MAX_WALLCLOCK_SECONDS=600 \
 torchrun --standalone --nproc_per_node=1 train_gpt.py 2>&1 | tee logs/golfmix_base_1xh100.log
 ```
 
+## C1. Base default size check
+
+Uses the selected public base BigramHash size (`10240`). `BIGRAM_VOCAB_SIZE_OVERRIDE` is explicitly unset.
+
+```bash
+env -u BIGRAM_VOCAB_SIZE_OVERRIDE \
+RUN_ID=golfmix_size_default_10240 \
+USE_DAFFN=0 \
+USE_STARRELU=0 \
+USE_NGRAM_MIX=0 \
+MAX_WALLCLOCK_SECONDS=120 \
+torchrun --standalone --nproc_per_node=1 train_gpt.py 2>&1 | tee logs/golfmix_size_default_10240.log
+```
+
+## C2. Size-safe run with BigramHash 8192
+
+```bash
+RUN_ID=golfmix_size_safe_8192 \
+BIGRAM_VOCAB_SIZE_OVERRIDE=8192 \
+USE_DAFFN=0 \
+USE_STARRELU=0 \
+USE_NGRAM_MIX=0 \
+MAX_WALLCLOCK_SECONDS=120 \
+torchrun --standalone --nproc_per_node=1 train_gpt.py 2>&1 | tee logs/golfmix_size_safe_8192.log
+```
+
+## C3. Size-safe run with BigramHash 9216
+
+```bash
+RUN_ID=golfmix_size_safe_9216 \
+BIGRAM_VOCAB_SIZE_OVERRIDE=9216 \
+USE_DAFFN=0 \
+USE_STARRELU=0 \
+USE_NGRAM_MIX=0 \
+MAX_WALLCLOCK_SECONDS=120 \
+torchrun --standalone --nproc_per_node=1 train_gpt.py 2>&1 | tee logs/golfmix_size_safe_9216.log
+```
+
 ## D. DAFFN middle-heavy ablation
 
 ```bash
