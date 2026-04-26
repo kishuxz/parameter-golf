@@ -1,0 +1,14 @@
+{
+  "name": "Kishore Kumar Ramkumar",
+  "github_id": "kishuxz",
+  "val_bpb": null,
+  "techniques": [
+    "strong_public_base",
+    "depth_adaptive_ffn_optional",
+    "starrelu_optional",
+    "ngram_mix_optional_if_enabled"
+  ],
+  "track": "10min_16mb",
+  "date": "2026-04-26",
+  "notes": "Leaderboard-focused implementation based on strongest reproducible public stack with optional DAFFN-Star ablation."
+}
